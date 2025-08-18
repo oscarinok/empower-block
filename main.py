@@ -1,47 +1,49 @@
 from fastapi import FastAPI, Request
-import httpx
+import os, httpx
 
 app = FastAPI()
 
-# ⚠️ Solo per test, poi sposta la chiave in variabile d’ambiente!
-RINGOVER_API_KEY = "b637bc5556e16016596eef12e03b75b88b4fb3aa"
-RINGOVER_API_BASE = "https://public-api.ringover.com"
+# TIP: dopo i test mettila in ENV su Render (Settings → Environment)
+RINGOVER_API_KEY = os.getenv("RINGOVER_API_KEY", "b637bc5556e16016596eef12e03b75b88b4fb3aa")
 
+HEADERS = {"Authorization": f"Bearer {RINGOVER_API_KEY}"}
+
+async def safe_delete(client: httpx.AsyncClient, url: str) -> bool:
+    try:
+        r = await client.delete(url, headers=HEADERS, timeout=10)
+        # 200/204 = cancellato; 404 = già non esiste → per noi è OK
+        return r.status_code in (200, 204, 404)
+    except Exception:
+        return False
 
 @app.get("/")
 async def health():
     return {"status": "ok"}
 
-
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    """
-    Riceve il webhook da Ringover/Empower quando una call è stata processata
-    e cancella immediatamente la registrazione audio.
-    Non salva né stampa URL o contenuti sensibili.
-    """
     data = await request.json()
 
     call_id       = data.get("call_id")
     recording_id  = data.get("recording_id")
+    # alcuni payload usano questi campi
     recording_url = data.get("recording_url") or data.get("audio_url")
 
-    if not call_id and not recording_id and not recording_url:
-        return {"status": "ignored", "reason": "no identifiers"}
+    deleted = False
+    async with httpx.AsyncClient() as client:
+        # 1) se abbiamo recording_id: endpoint diretto
+        if recording_id and not deleted:
+            deleted = await safe_delete(client, f"https://public-api.ringover.com/recordings/{recording_id}")
 
-    headers = {"Authorization": f"Bearer {RINGOVER_API_KEY}"}
+        # 2) fallback via call_id (alcune org lo usano)
+        if call_id and not deleted:
+            # vecchio endpoint
+            deleted = await safe_delete(client, f"https://public-api.ringover.com/recordings/{call_id}")
+        if call_id and not deleted:
+            # endpoint v2 (alcune aziende lo espongono)
+            deleted = await safe_delete(client, f"https://public-api.ringover.com/v2/calls/{call_id}/recordings")
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        if recording_id:
-            try:
-                await client.delete(f"{RINGOVER_API_BASE}/recordings/{recording_id}", headers=headers)
-            except Exception:
-                pass
+        # 3) se abbiamo solo l’URL NON lo salviamo, NON lo logghiamo (privacy). Ignoriamo.
 
-        if call_id:
-            try:
-                await client.delete(f"{RINGOVER_API_BASE}/recordings/{call_id}", headers=headers)
-            except Exception:
-                pass
+    return {"status": "ok", "deleted": bool(deleted)}
 
-    return {"status": "ok", "deleted": True}
