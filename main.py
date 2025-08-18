@@ -1,41 +1,52 @@
-from fastapi import FastAPI, Request
-import asyncio
-import httpx
-import os
+# main.py
+from fastapi import FastAPI, Request, BackgroundTasks
+import os, asyncio, httpx
 
 app = FastAPI()
 
-# URL API Pipedrive (qui va messo quello giusto della tua azienda)
-PIPEDRIVE_URL = "https://api.pipedrive.com/v1/notes"
-PIPEDRIVE_TOKEN = os.getenv("PIPEDRIVE_TOKEN")  # tienilo sicuro come variabile
+# 🔐 Metti la chiave su Render > Settings > Environment: RINGOVER_API_KEY=...
+RINGOVER_API_KEY = os.getenv("RINGOVER_API_KEY", "b637bc5556e16016596eef12e03b75b88b4fb3aa")
+HEADERS = {"Authorization": f"Bearer {RINGOVER_API_KEY}"}
+
+async def delayed_delete(call_id: str | None, recording_id: str | None, delay_sec: int = 180):
+    # aspetta che Empower finisca di processare (trascrizione, score, summary)
+    await asyncio.sleep(delay_sec)
+    async with httpx.AsyncClient(timeout=8) as client:
+        # 1) endpoint diretto se abbiamo recording_id
+        if recording_id:
+            try:
+                r = await client.delete(
+                    f"https://public-api.ringover.com/recordings/{recording_id}",
+                    headers=HEADERS
+                )
+                if r.status_code in (200, 204, 404):  # 404 = già sparito → ok
+                    return
+            except Exception:
+                pass
+        # 2) fallback via call_id (API v2)
+        if call_id:
+            try:
+                await client.delete(
+                    f"https://public-api.ringover.com/v2/calls/{call_id}/recordings",
+                    headers=HEADERS
+                )
+            except Exception:
+                pass
 
 @app.get("/")
 async def health():
-    return {"status": "running", "mode": "clean_audio_links"}
+    return {"status": "running", "mode": "delayed_delete", "delay_sec": 180}
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    # non bloccare Empower: leggi payload e ritorna SUBITO 200
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
 
-    # Attendere 3 minuti prima di processare
-    await asyncio.sleep(180)
+    call_id      = data.get("call_id") or data.get("call_uuid")
+    recording_id = data.get("recording_id")
 
-    # Rimuovere audioFileLink se presente
-    if "call_details" in data and "audioFileLink" in data["call_details"]:
-        del data["call_details"]["audioFileLink"]
-
-    # Esempio: mandare il testo a Pipedrive come nota
-    note_content = f"Call UUID: {data['call_details'].get('call_uuid', '')}\n\n"
-    if "call_score" in data:
-        note_content += f"Score: {data['call_score']}\n\n"
-    if "transcription" in data:
-        note_content += f"Transcript: {data['transcription']}\n"
-
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            PIPEDRIVE_URL,
-            params={"api_token": PIPEDRIVE_TOKEN},
-            json={"content": note_content}
-        )
-
-    return {"status": "ok", "action": "cleaned", "note_sent": True}
+    background_tasks.add_task(delayed_delete, call_id, recording_id, 180)  # 3 minuti
+    return {"status": "ok", "queued": True}
