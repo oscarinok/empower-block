@@ -5,15 +5,15 @@ from typing import Optional, Dict, Tuple, List
 app = FastAPI()
 
 # ========= CONFIG =========
-# TUA API KEY (come da screenshot)
+# TUA API KEY
 RINGOVER_API_KEY = "4dda64fbf2ac86463b995be126b906fec64b1cb2"
 
 API_BASE = "https://public-api.ringover.com"
 HEADERS = {"Authorization": f"Bearer {RINGOVER_API_KEY}"}
 
-# primo tentativo dopo 90s, poi retry a 180s e 300s
+# primo tentativo dopo 90s, poi retry periodici
 INITIAL_DELAY = 90
-RETRY_AT = [180, 300]
+PENDING_CHECK_PERIOD = 60  # ogni 60s ricontrollo
 
 # controllo semplice di UUID in eventuali URL
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -21,21 +21,20 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 # accodiamo le call senza recording_id:
 # pending[(call_id, call_uuid)] = {"added": epoch, "tries": n}
 pending: Dict[Tuple[Optional[str], Optional[str]], Dict[str, float]] = {}
-PENDING_CHECK_PERIOD = 60  # ogni 60s ricontrollo
 
 # ========= HELPER HTTP =========
 async def _delete_rec_by_id(client: httpx.AsyncClient, rec_id: str) -> bool:
     url = f"{API_BASE}/recordings/{rec_id}"
     r = await client.delete(url, headers=HEADERS, timeout=15)
     print(f"[DELETE rec] {rec_id} -> {r.status_code} {r.text[:160]}")
-    return r.status_code in (200, 204, 404)
+    return r.status_code in (200, 204, 404)  # 404 = già sparito → per noi va bene
 
 async def _delete_all_by_call_id(client: httpx.AsyncClient, call_id: str) -> bool:
-    # alcuni tenant espongono il bulk su /v2/calls/{id}/recordings
+    # alcuni tenant NON hanno questo endpoint → 404: fallimento, così proseguiamo coi GET
     url = f"{API_BASE}/v2/calls/{call_id}/recordings"
     r = await client.delete(url, headers=HEADERS, timeout=15)
     print(f"[DELETE call/all] {call_id} -> {r.status_code} {r.text[:160]}")
-    return r.status_code in (200, 204, 404)
+    return r.status_code in (200, 204)  # <— FIX: 404 NON è più successo
 
 async def _get_call_by_id(client: httpx.AsyncClient, call_id: str):
     url = f"{API_BASE}/v2/calls/{call_id}"
@@ -44,7 +43,7 @@ async def _get_call_by_id(client: httpx.AsyncClient, call_id: str):
     return r.json() if r.status_code == 200 else None
 
 async def _get_call_by_uuid(client: httpx.AsyncClient, call_uuid: str):
-    # tentiamo due path diversi
+    # tentiamo due path diversi (tenants diversi espongono path diversi)
     for path in (f"/v2/calls/uuid/{call_uuid}", f"/calls/{call_uuid}"):
         url = f"{API_BASE}{path}"
         r = await client.get(url, headers=HEADERS, timeout=15)
@@ -81,15 +80,17 @@ async def _try_delete_paths(call_id: Optional[str], call_uuid: Optional[str],
             if await _delete_rec_by_id(client, recording_id):
                 return True
 
-        # 2) estrai uuid dall'audio_url
+        # 2) estrai uuid dall'audio_url e prova delete
         if audio_url:
             m = UUID_RE.search(audio_url)
             if m and await _delete_rec_by_id(client, m.group(0)):
                 return True
 
-        # 3) bulk da call_id
-        if call_id and await _delete_all_by_call_id(client, call_id):
-            return True
+        # 3) bulk da call_id (se il tenant lo supporta)
+        if call_id:
+            bulk_ok = await _delete_all_by_call_id(client, call_id)
+            if bulk_ok:
+                return True  # se 404, bulk_ok=False e si prosegue
 
         # 4) GET call by id → cancella tutti i recording trovati
         if call_id:
@@ -112,10 +113,6 @@ async def _try_delete_paths(call_id: Optional[str], call_uuid: Optional[str],
                 ok_any = ok_any or ok
             if ok_any:
                 return True
-
-        # 6) fallback finale: se abbiamo call_id, ritenta bulk
-        if call_id:
-            return await _delete_all_by_call_id(client, call_id)
 
         return False
 
@@ -152,8 +149,8 @@ async def _process_pending_forever():
                         pending.pop(key, None)
                         continue
 
-                    # stoppo dopo ultimo retry (tempo ~5 minuti)
-                    if tries >= 2:  # abbiamo già fatto il primo differito + 2 retry timer → fine
+                    # dopo 2 giri (≈ 3–5 minuti totali) molliamo
+                    if tries >= 2:
                         print(f"[GIVEUP] {key}")
                         pending.pop(key, None)
             await asyncio.sleep(PENDING_CHECK_PERIOD)
@@ -171,7 +168,7 @@ async def health():
     return {
         "status": "running",
         "mode": "fetch-and-delete",
-        "delay": INITIAL_DELAY,
+        "initial_delay": INITIAL_DELAY,
         "pending": len(pending)
     }
 
