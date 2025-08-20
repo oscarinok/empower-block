@@ -5,36 +5,31 @@ from typing import Optional, Dict, Tuple, List
 app = FastAPI()
 
 # ========= CONFIG =========
-# TUA API KEY
-RINGOVER_API_KEY = "4dda64fbf2ac86463b995be126b906fec64b1cb2"
-
+RINGOVER_API_KEY = "4dda64fbf2ac86463b995be126b906fec64b1cb2"  # tua key
 API_BASE = "https://public-api.ringover.com"
 HEADERS = {"Authorization": f"Bearer {RINGOVER_API_KEY}"}
 
-# primo tentativo dopo 90s, poi retry periodici
+# attese/ritenti per dare tempo a Ringover di allegare l'audio
 INITIAL_DELAY = 90
-PENDING_CHECK_PERIOD = 60  # ogni 60s ricontrollo
+PENDING_CHECK_PERIOD = 60
 
-# controllo semplice di UUID in eventuali URL
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
-# accodiamo le call senza recording_id:
-# pending[(call_id, call_uuid)] = {"added": epoch, "tries": n}
 pending: Dict[Tuple[Optional[str], Optional[str]], Dict[str, float]] = {}
 
-# ========= HELPER HTTP =========
+# ========= HTTP HELPERS =========
 async def _delete_rec_by_id(client: httpx.AsyncClient, rec_id: str) -> bool:
     url = f"{API_BASE}/recordings/{rec_id}"
     r = await client.delete(url, headers=HEADERS, timeout=15)
     print(f"[DELETE rec] {rec_id} -> {r.status_code} {r.text[:160]}")
-    return r.status_code in (200, 204, 404)  # 404 = già sparito → per noi va bene
+    return r.status_code in (200, 204, 404)  # 404 = già sparito
 
 async def _delete_all_by_call_id(client: httpx.AsyncClient, call_id: str) -> bool:
-    # alcuni tenant NON hanno questo endpoint → 404: fallimento, così proseguiamo coi GET
+    # Alcuni tenant non espongono questo endpoint → 404: fallimento (così proseguiamo coi GET)
     url = f"{API_BASE}/v2/calls/{call_id}/recordings"
     r = await client.delete(url, headers=HEADERS, timeout=15)
     print(f"[DELETE call/all] {call_id} -> {r.status_code} {r.text[:160]}")
-    return r.status_code in (200, 204)  # <— FIX: 404 NON è più successo
+    return r.status_code in (200, 204)
 
 async def _get_call_by_id(client: httpx.AsyncClient, call_id: str):
     url = f"{API_BASE}/v2/calls/{call_id}"
@@ -43,7 +38,7 @@ async def _get_call_by_id(client: httpx.AsyncClient, call_id: str):
     return r.json() if r.status_code == 200 else None
 
 async def _get_call_by_uuid(client: httpx.AsyncClient, call_uuid: str):
-    # tentiamo due path diversi (tenants diversi espongono path diversi)
+    # Tenant diversi espongono path diversi
     for path in (f"/v2/calls/uuid/{call_uuid}", f"/calls/{call_uuid}"):
         url = f"{API_BASE}{path}"
         r = await client.get(url, headers=HEADERS, timeout=15)
@@ -56,7 +51,8 @@ def _extract_rec_ids(call_json) -> List[str]:
     if not isinstance(call_json, dict):
         return []
     recs = set()
-    # proviamo vari campi comuni
+
+    # campi comuni che possono contenere recording ids
     for k in ("recordings", "recording_ids", "media", "audio"):
         v = call_json.get(k)
         if isinstance(v, list):
@@ -66,31 +62,43 @@ def _extract_rec_ids(call_json) -> List[str]:
                 elif isinstance(it, dict):
                     rid = it.get("id") or it.get("recording_id")
                     if rid:
-                        recs.add(rid)
-    # alcuni payload mettono direttamente "recording_id"
+                        recs.add(str(rid))
+
+    # diretti
     if call_json.get("recording_id"):
         recs.add(str(call_json["recording_id"]))
+
+    # a volte i recording stanno dentro nested "resources"/"links"
+    for k in ("resources", "links", "data"):
+        v = call_json.get(k)
+        if isinstance(v, list):
+            for it in v:
+                if isinstance(it, dict):
+                    rid = it.get("recording_id") or it.get("id")
+                    if rid:
+                        recs.add(str(rid))
+
     return list(recs)
 
 async def _try_delete_paths(call_id: Optional[str], call_uuid: Optional[str],
                             recording_id: Optional[str], audio_url: Optional[str]) -> bool:
     async with httpx.AsyncClient() as client:
-        # 1) recording_id diretto
+        # 1) recording_id diretto (se mai arrivasse)
         if recording_id:
             if await _delete_rec_by_id(client, recording_id):
                 return True
 
-        # 2) estrai uuid dall'audio_url e prova delete
+        # 2) estrai uuid dall'audio_url (se mai arrivasse)
         if audio_url:
             m = UUID_RE.search(audio_url)
             if m and await _delete_rec_by_id(client, m.group(0)):
                 return True
 
-        # 3) bulk da call_id (se il tenant lo supporta)
+        # 3) bulk da call_id (se supportato)
         if call_id:
             bulk_ok = await _delete_all_by_call_id(client, call_id)
             if bulk_ok:
-                return True  # se 404, bulk_ok=False e si prosegue
+                return True  # se non supportato, proseguiamo
 
         # 4) GET call by id → cancella tutti i recording trovati
         if call_id:
@@ -98,19 +106,17 @@ async def _try_delete_paths(call_id: Optional[str], call_uuid: Optional[str],
             ids = _extract_rec_ids(cj)
             ok_any = False
             for rid in ids:
-                ok = await _delete_rec_by_id(client, rid)
-                ok_any = ok_any or ok
+                ok_any = await _delete_rec_by_id(client, rid) or ok_any
             if ok_any:
                 return True
 
-        # 5) GET call by uuid → come sopra
+        # 5) GET call by uuid → idem
         if call_uuid:
             cj = await _get_call_by_uuid(client, call_uuid)
             ids = _extract_rec_ids(cj)
             ok_any = False
             for rid in ids:
-                ok = await _delete_rec_by_id(client, rid)
-                ok_any = ok_any or ok
+                ok_any = await _delete_rec_by_id(client, rid) or ok_any
             if ok_any:
                 return True
 
@@ -119,14 +125,12 @@ async def _try_delete_paths(call_id: Optional[str], call_uuid: Optional[str],
 # ========= SCHEDULING =========
 async def _delayed_cleanup(call_id: Optional[str], call_uuid: Optional[str],
                            recording_id: Optional[str], audio_url: Optional[str]):
-    # primo tentativo differito
-    await asyncio.sleep(INITIAL_DELAY)
+    await asyncio.sleep(INITIAL_DELAY)   # lascia il tempo a Ringover di agganciare l'audio
     ok = await _try_delete_paths(call_id, call_uuid, recording_id, audio_url)
     if ok:
         print("[CLEAN] done @~90s")
         return
 
-    # se non è andata, mettiamo in pending per i retry periodici
     key = (call_id, call_uuid)
     pending[key] = {"added": time.time(), "tries": 0}
     print(f"[QUEUE] added pending {key}")
@@ -135,22 +139,19 @@ async def _process_pending_forever():
     while True:
         try:
             if pending:
-                keys = list(pending.keys())
-                for key in keys:
+                for key in list(pending.keys()):
                     call_id, call_uuid = key
                     meta = pending.get(key, {"tries": 0})
-                    tries = meta.get("tries", 0) + 1
-                    pending[key]["tries"] = tries
+                    meta["tries"] = meta.get("tries", 0) + 1
+                    pending[key] = meta
 
-                    print(f"[RETRY] {key} try#{tries}")
+                    print(f"[RETRY] {key} try#{meta['tries']}")
                     ok = await _try_delete_paths(call_id, call_uuid, None, None)
                     if ok:
                         print(f"[CLEAN] pending {key} removed")
                         pending.pop(key, None)
                         continue
-
-                    # dopo 2 giri (≈ 3–5 minuti totali) molliamo
-                    if tries >= 2:
+                    if meta["tries"] >= 2:   # due giri (≈3–5 min totali) e molliamo
                         print(f"[GIVEUP] {key}")
                         pending.pop(key, None)
             await asyncio.sleep(PENDING_CHECK_PERIOD)
@@ -165,12 +166,7 @@ async def _startup():
 
 @app.get("/")
 async def health():
-    return {
-        "status": "running",
-        "mode": "fetch-and-delete",
-        "initial_delay": INITIAL_DELAY,
-        "pending": len(pending)
-    }
+    return {"status": "running", "pending": len(pending), "initial_delay": INITIAL_DELAY}
 
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
@@ -179,7 +175,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         data = {}
 
-    # normalizziamo i campi possibili (Empower / Ringover)
     call_details = data.get("call_details") or {}
     call_id      = data.get("call_id") or call_details.get("ringover_id")
     call_uuid    = data.get("call_uuid") or call_details.get("call_uuid")
@@ -188,6 +183,5 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     print(f"[WEBHOOK] call_id={call_id} call_uuid={call_uuid} recording_id={recording_id} audio_url={audio_url}")
 
-    # schedulo il ciclo di pulizia (differito + eventuale coda)
     background_tasks.add_task(_delayed_cleanup, call_id, call_uuid, recording_id, audio_url)
     return {"status": "ok", "queued": True}
